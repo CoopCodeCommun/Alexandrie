@@ -1,0 +1,21 @@
+# Le fichier de configuration de LA machine : secrets de la base, cle JWT,
+# passphrase du depot de sauvegarde. Il n'existe qu'ici.
+.env
+
+# Cles SSH dediees aux depots borg (une cle = un depot).
+bin/.ssh/
+
+# Session ouverte par le skill `alx` : elle porte un jeton de connexion.
+.claude/skills/alexandrie/.session
+
+# Dossiers de travail des scripts de sauvegarde et de restauration.
+.dump-*/
+.restauration-*/
+.backup-*.lock
+
+# Marqueur pose par `make backup-check` pendant la phase destructrice :
+# il empeche le cron de sauvegarder une stack vide.
+.repetition-*.encours
+
+# Le depot borg local que `make backup` propose sur un poste de dev.
+.borg-local/

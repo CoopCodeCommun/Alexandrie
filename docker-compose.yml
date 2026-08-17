@@ -1,0 +1,323 @@
+# =============================================================================
+# Alexandrie — auto-hebergement derriere Traefik
+# / Alexandrie — self-hosting behind Traefik
+#
+# Quatre services : mysql, rustfs (stockage S3), backend (Go), frontend (Nuxt).
+# Seuls les TROIS DERNIERS sont joignables, et uniquement par Traefik. MySQL
+# n'a ni port publie ni etiquette : rien ne l'atteint depuis l'exterieur.
+#
+# TOUT :
+#   make install        (ou : docker compose up -d, apres avoir cree le .env)
+#   make                la liste des cibles
+#
+# TROIS HOTES, PAS UN
+#
+#   ${DOMAIN}           le site
+#   api.${DOMAIN}       l'API
+#   cdn.${DOMAIN}       les fichiers
+#
+# Ce decoupage n'est pas un gout : c'est le seul qui marche.
+#
+#   - Le CDN ne peut PAS vivre sous un chemin (`/files/`). La specification
+#     S3 interdit un chemin dans l'URL qui sert a signer ; l'amont le
+#     documente dans docs/FAQ.md, symptome « XML syntax error on line 1 ».
+#     Il lui faut donc un hote a lui.
+#   - COOKIE_DOMAIN doit etre le plus haut domaine COMMUN au site et a
+#     l'API. Avec `${DOMAIN}` et `api.${DOMAIN}`, c'est `${DOMAIN}`. Mal
+#     regle, le login REUSSIT puis l'utilisateur est deconnecte a la
+#     seconde suivante, sans un message nulle part.
+#
+# / Three hosts, because S3 signing forbids a path in the CDN URL, and the
+# cookie domain must be the highest domain shared by site and API.
+#
+# LES ETIQUETTES TRAEFIK NE FIXENT PAS D'ENTRYPOINT, VOLONTAIREMENT
+#
+# Le Traefik de production (../TraefikV3) nomme ses points d'entree `web` et
+# `websecure` ; celui qui tourne sur un poste de dev les nomme autrement.
+# Sans etiquette `entrypoints`, le routeur se pose sur TOUS ceux qui
+# existent : le meme fichier marche des deux cotes. Le resolveur de
+# certificat, lui, est surchargeable par CERT_RESOLVER.
+# / No entrypoint label: the router binds to whichever entrypoints exist,
+# so this file works against both Traefik configurations.
+# =============================================================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: alexandrie_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD absent du .env — lancer make install}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-alexandrie}
+      MYSQL_USER: ${MYSQL_USER:-alexandrie}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD absent du .env — lancer make install}
+    # 423 Mo au repos, et a peine plus sous charge d'ecriture (437 Mo
+    # apres 60 documents crees de front) : l'essentiel est FIXE, pas
+    # proportionnel au trafic. Mesure interne du 17 aout 2026 :
+    #     performance_schema  230 Mo
+    #     innodb              196 Mo   (dont 128 Mo de buffer pool)
+    #     le reste             20 Mo
+    #
+    # `performance_schema` est donc le premier poste — plus gros que la
+    # base elle-meme. C'est un outil de diagnostic, inutile a une
+    # instance qui sert quelques dizaines de personnes. Le couper divise
+    # a peu pres par deux l'empreinte de MySQL : voir PERFORMANCE_SCHEMA
+    # dans le .env.
+    # / performance_schema is the largest single item — bigger than
+    # InnoDB. It is a diagnostic tool, useless to a small instance.
+    command: >
+      --performance-schema=${PERFORMANCE_SCHEMA:-OFF}
+      --innodb-buffer-pool-size=${INNODB_BUFFER_POOL:-128M}
+    mem_limit: ${LIMITE_MEMOIRE_MYSQL:-512m}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} -e 'SELECT 1' $${MYSQL_DATABASE}"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    # Aucun port publie, aucune etiquette traefik : la base n'est joignable
+    # que par les autres conteneurs du reseau interne.
+    # / No published port, no traefik label.
+    networks:
+      - alexandrie
+
+  rustfs:
+    # `latest` SUR UN MOTEUR DE STOCKAGE, c'est un choix, pas un oubli.
+    # MySQL est epingle en 8.0, rustfs ne l'est pas : `make update` peut
+    # donc lui faire changer de version — et de format de donnees — du
+    # jour au lendemain. C'est ce que fait l'amont, et rustfs est encore
+    # jeune : suivre est plus sur que figer une version qui ne recevra
+    # plus de correctif.
+    # Sur une installation ou la stabilite prime, epingler ici la version
+    # en service (`make update` affiche son empreinte) et la relever
+    # deliberement. / Pinning is a deliberate trade-off; rustfs is young.
+    image: rustfs/rustfs:latest
+    container_name: alexandrie_rustfs
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY absent du .env — lancer make install}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY absent du .env — lancer make install}
+      RUSTFS_CONSOLE_ENABLE: "${RUSTFS_CONSOLE_ENABLE:-false}"
+      RUSTFS_LOG_LEVEL: ${RUSTFS_LOG_LEVEL:-error}
+    # 176 Mo au repos, 177 Mo sous charge : un moteur de stockage objet
+    # dont l'empreinte ne suit pas le trafic mais la taille de son index.
+    # La limite est large : elle grandira avec le nombre d'objets.
+    # / Its footprint follows the index size, not the traffic.
+    mem_limit: ${LIMITE_MEMOIRE_RUSTFS:-512m}
+    volumes:
+      - rustfs_data:/data
+      - rustfs_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=frontend"
+      - "traefik.http.routers.alexandrie-cdn.rule=Host(`cdn.${DOMAIN}`)"
+      - "traefik.http.routers.alexandrie-cdn.tls=true"
+      - "traefik.http.routers.alexandrie-cdn.tls.certresolver=${CERT_RESOLVER:-}"
+      - "traefik.http.services.alexandrie-cdn.loadbalancer.server.port=9000"
+    networks:
+      - frontend
+      - alexandrie
+
+  backend:
+    image: ghcr.io/smaug6739/alexandrie-backend:${ALEXANDRIE_TAG:-latest}
+    container_name: alexandrie_backend
+    # L'amont oublie `restart` sur ce service : un backend tombe ne
+    # repartait pas, et le site rendait des erreurs jusqu'au prochain
+    # `up -d` fait a la main.
+    # / Upstream omits `restart` here: a crashed backend never came back.
+    restart: unless-stopped
+    environment:
+      BACKEND_PORT: 8201
+      GIN_MODE: release
+
+      # --- Securite et authentification ---
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET absent du .env — lancer make install}
+      # SANS PROTOCOLE ET SANS PORT. Avec `https://` ou `:8200`, le cookie
+      # est pose sur un domaine qui n'existe pas et la session est perdue
+      # a la premiere navigation. / No protocol, no port.
+      COOKIE_DOMAIN: ${DOMAIN}
+      FRONTEND_URL: ${FRONTEND_URL}
+      # false = les cookies portent le drapeau Secure. Traefik termine le
+      # TLS, le navigateur parle donc toujours en HTTPS : c'est le bon
+      # reglage meme quand le certificat est auto-signe.
+      # / false = Secure cookies; Traefik terminates TLS.
+      ALLOW_UNSECURE: "${ALLOW_UNSECURE:-false}"
+
+      # --- Drapeaux ---
+      CONFIG_DISABLE_SIGNUP: "${CONFIG_DISABLE_SIGNUP:-false}"
+      CONFIG_DISABLE_NATIVE_LOGIN: "${CONFIG_DISABLE_NATIVE_LOGIN:-false}"
+      ADMIN_ACCOUNTS: ${ADMIN_ACCOUNTS:-}
+
+      # --- Base de donnees ---
+      DATABASE_HOST: mysql
+      DATABASE_PORT: 3306
+      DATABASE_NAME: ${MYSQL_DATABASE:-alexandrie}
+      DATABASE_USER: ${MYSQL_USER:-alexandrie}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD}
+
+      # --- Stockage objet ---
+      # Le backend ouvre DEUX clients S3 : un INTERNE, qui parle a rustfs
+      # sur le reseau docker en clair (d'ou MINIO_SECURE=false), et un
+      # SIGNEUR, qui fabrique les URLs publiques a partir de
+      # MINIO_PUBLIC_URL — c'est son schema `https://` qui rend les liens
+      # en HTTPS. Les deux ne pointent pas au meme endroit, et c'est
+      # normal. / Two S3 clients: an internal one (plain HTTP inside the
+      # docker network) and a signer that builds public URLs.
+      MINIO_ENDPOINT: rustfs:9000
+      MINIO_SECURE: "false"
+      MINIO_PUBLIC_URL: ${CDN_URL}
+      MINIO_ACCESSKEY: ${RUSTFS_ACCESS_KEY}
+      MINIO_SECRETKEY: ${RUSTFS_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-alexandrie}
+      # Le client signeur joint le CDN par son nom PUBLIC. Derriere un
+      # certificat auto-signe (poste de dev, `.localhost`), il refuserait
+      # la connexion. Vaut `false` en production, ou le certificat est
+      # signe par une autorite reconnue.
+      # / The signer reaches the CDN by its public name; a self-signed
+      # certificate would be refused.
+      MINIO_INSECURE_TLS: "${MINIO_INSECURE_TLS:-false}"
+
+      # --- Courriel (facultatif : seulement la reinitialisation de mot de passe) ---
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_MAIL: ${SMTP_MAIL:-}
+      SMTP_MAIL_FROM: ${SMTP_MAIL_FROM:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    # LE BACKEND SORT VERS LE NOM PUBLIC DU CDN, et il faut le savoir.
+    #
+    # Avant de signer une URL de telechargement, le client S3 signeur
+    # demande au CDN la region du bucket :
+    #     GET https://cdn.<domaine>/<bucket>/?location=
+    # C'est un VRAI appel reseau, sortant, vers l'adresse publique — pas
+    # un calcul local. Sans cette ligne, il echoue de deux facons selon
+    # l'endroit :
+    #
+    #   - en `.localhost`, le nom resout sur la boucle locale DU
+    #     CONTENEUR, ou rien n'ecoute :
+    #     « dial tcp [::1]:443: connect: connection refused » ;
+    #   - en production derriere un routeur NAT, le conteneur vise
+    #     l'adresse publique de la machine et le routeur ne sait pas
+    #     renvoyer le paquet chez lui (pas d'epingle a cheveux).
+    #
+    # Dans les deux cas, le symptome est le meme et il est trompeur :
+    # « Failed to generate download URL: XML syntax error on line 1 » ou
+    # « connection refused », sur la fonction d'export d'Alexandrie
+    # UNIQUEMENT. Le reste du site marche — televersement compris — parce
+    # que le client signeur ne sert qu'a ca. On cherche donc un probleme
+    # de stockage la ou il n'y a qu'un probleme de routage.
+    #
+    # `host-gateway` fait pointer ce nom, POUR CE CONTENEUR SEULEMENT,
+    # vers l'hote — donc vers le Traefik qui publie le 443. Le certificat
+    # reste valide : c'est le NOM qui voyage dans le SNI, pas l'adresse.
+    # / The backend really dials the public CDN name to read the bucket
+    # region before signing. Without this it fails on loopback in dev and
+    # on NAT hairpinning in production, with a message that points at
+    # storage when the problem is routing.
+    # 9 Mo au repos, 14,5 Mo sous charge. C'est du Go : pas de machine
+    # virtuelle, pas de tas a dimensionner. La limite est vingt fois la
+    # mesure — elle n'existe que pour qu'une fuite eventuelle tue le
+    # backend plutot que la machine.
+    # / Go: no VM, no heap to size. The limit exists so that a leak would
+    # kill the backend rather than the machine.
+    mem_limit: ${LIMITE_MEMOIRE_BACKEND:-256m}
+    extra_hosts:
+      - "cdn.${DOMAIN}:host-gateway"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=frontend"
+      - "traefik.http.routers.alexandrie-api.rule=Host(`api.${DOMAIN}`)"
+      - "traefik.http.routers.alexandrie-api.tls=true"
+      - "traefik.http.routers.alexandrie-api.tls.certresolver=${CERT_RESOLVER:-}"
+      - "traefik.http.services.alexandrie-api.loadbalancer.server.port=8201"
+    networks:
+      - frontend
+      - alexandrie
+
+  frontend:
+    image: ghcr.io/smaug6739/alexandrie-frontend:${ALEXANDRIE_TAG:-latest}
+    container_name: alexandrie_frontend
+    restart: unless-stopped
+    # LE SERVICE LE PLUS GOURMAND, ET DE LOIN — mesures du 17 aout 2026,
+    # sur cette stack : 86 Mo au repos, 345 Mo apres 150 rendus de page
+    # simultanes, puis retour a 107 Mo en 90 secondes. Ce n'est donc PAS
+    # une fuite : c'est le tas de V8, qui grandit sous charge et se rend
+    # ensuite.
+    #
+    # Mais sans plafond, Node dimensionne son tas d'apres la memoire
+    # VISIBLE de la machine — 30 Gio ici. Sur un petit serveur, une pointe
+    # de trafic peut donc epuiser la RAM de l'hote, et c'est alors le noyau
+    # qui choisit quoi tuer : possiblement MySQL, en pleine ecriture.
+    #
+    # `mem_limit` seul ne suffit pas : le conteneur se ferait tuer par le
+    # cgroup, brutalement. `--max-old-space-size` dit a V8 ou est le mur,
+    # AVANT qu'il s'y cogne — il declenche alors un ramasse-miettes plutot
+    # qu'une mort subite. Les deux vont ENSEMBLE, et la valeur Node reste
+    # SOUS la limite du conteneur (le tas n'est pas toute la memoire d'un
+    # process Node : il y a aussi le code, les piles, les tampons).
+    # / Not a leak: V8's heap grows under load and gives it back. But
+    # without a ceiling Node sizes its heap from the host's visible
+    # memory. mem_limit alone kills the container; --max-old-space-size
+    # tells V8 where the wall is, so it collects instead of dying.
+    mem_limit: ${LIMITE_MEMOIRE_FRONTEND:-512m}
+    environment:
+      PORT: 8200
+      NODE_OPTIONS: --max-old-space-size=${TAS_NODE_MO:-384}
+      NUXT_PUBLIC_CONFIG_DISABLE_SIGNUP_PAGE: "${CONFIG_DISABLE_SIGNUP:-false}"
+      NUXT_PUBLIC_CONFIG_DISABLE_LANDING_PAGE: "${CONFIG_DISABLE_LANDING:-false}"
+      # Ces quatre valeurs sont figees dans le bundle AU DEMARRAGE du
+      # conteneur : les changer dans le .env demande de RECREER le
+      # conteneur (`docker compose up -d`), un `restart` ne suffit pas.
+      # / Baked into the bundle at container start: a restart is not
+      # enough, the container must be recreated.
+      NUXT_PUBLIC_BASE_API: ${API_URL}
+      NUXT_PUBLIC_BASE_CDN: ${CDN_URL}
+      NUXT_PUBLIC_CDN_ENDPOINT: ${CDN_ENDPOINT:-/alexandrie/}
+      NUXT_PUBLIC_BASE_URL: ${FRONTEND_URL}
+    depends_on:
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=frontend"
+      - "traefik.http.routers.alexandrie.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.alexandrie.tls=true"
+      - "traefik.http.routers.alexandrie.tls.certresolver=${CERT_RESOLVER:-}"
+      - "traefik.http.services.alexandrie.loadbalancer.server.port=8200"
+    networks:
+      - frontend
+      - alexandrie
+
+networks:
+  # Celui de Traefik, cree une fois pour toutes sur la machine :
+  #   docker network create frontend
+  frontend:
+    external: true
+  alexandrie:
+
+volumes:
+  # LES NOMS SONT FIXES A LA MAIN, ET IL LE FAUT. Sans `name:`, docker
+  # compose les prefixe du nom du DOSSIER : `Alexandrie_mysql_data` ici,
+  # autre chose apres un `git clone` dans un dossier renomme. Or
+  # bin/backup.sh et bin/restore.sh nomment le volume rustfs en clair pour
+  # en sortir les fichiers — un prefixe qui bouge leur ferait sauvegarder
+  # un volume vide, sans un mot.
+  # / Fixed names: otherwise compose prefixes them with the directory
+  # name, and the backup scripts — which name the rustfs volume
+  # explicitly — would silently archive an empty one.
+  mysql_data:
+    name: alexandrie_mysql_data
+  rustfs_data:
+    name: alexandrie_rustfs_data
+  rustfs_logs:
+    name: alexandrie_rustfs_logs

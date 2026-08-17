@@ -1,0 +1,276 @@
+#!/bin/bash
+# =============================================================================
+# alx — pilote l'API d'Alexandrie depuis la ligne de commande
+#
+# S'EXECUTE DEPUIS LA RACINE DU DEPOT (il lit le .env pour connaitre le
+# domaine, et parle au conteneur frontend pour compiler le markdown).
+#
+# POURQUOI CE SCRIPT EXISTE, ET POURQUOI IL EST PLUS QU'UN `curl`
+#
+# Creer un document par l'API est facile : `POST /api/nodes`. Le piege est
+# ailleurs. Le backend NE COMPILE PAS le markdown : il stocke deux champs
+# separes, `content` (la source) et `content_compiled` (le HTML). Les vues
+# de lecture affichent litteralement `v-html="node.content_compiled"`,
+# SANS REPLI sur la source. Un document cree avec le seul `content`
+# s'affiche donc BLANC — la donnee est la, l'ecran est vide, et rien
+# n'explique pourquoi.
+#
+# Reimplementer leur compilateur est exclu : c'est markdown-it plus dix-huit
+# greffons maison (conteneurs, KaTeX, Mermaid, couleurs, cases a cocher,
+# liens internes, ancres, source-map...). La moindre difference produirait
+# un rendu qui derive du reste du site.
+#
+# On appelle donc LEUR compilateur, dans LEUR conteneur, a LEUR version :
+# l'image du frontend embarque Node et le bundle serveur de Nuxt, ou vit
+# `compile()`. Rien a installer, rien a versionner, aucune derive possible
+# — une mise a jour d'Alexandrie met a jour le compilateur du meme geste.
+#
+# USAGE
+#   ./alx login                            demande le mot de passe, garde la session
+#   ./alx whoami                           qui suis-je ?
+#   ./alx ls [role]                        liste les noeuds (role 1..4)
+#   ./alx compile <fichier.md>             rend le HTML sur la sortie standard
+#   ./alx doc-create <fichier.md> [--nom N] [--parent ID]
+#   ./alx doc-update <id> <fichier.md>
+#   ./alx upload <fichier>                 televerse, rend l'URL publique
+#   ./alx rm <id>                          supprime un noeud
+#
+# La session vit dans .claude/skills/alexandrie/.session (chmod 600, hors
+# git). Elle expire : relancer `login` quand l'API rend 401.
+# =============================================================================
+set -euo pipefail
+
+REPERTOIRE_DU_SKILL="$(cd -- "$(dirname -- "$0")" && pwd)"
+# Le depot est trois niveaux au-dessus : .claude/skills/alexandrie/
+REPERTOIRE_DU_PROJET="$(cd -- "$REPERTOIRE_DU_SKILL/../../.." && pwd)"
+FICHIER_ENV="${ENV_FILE:-$REPERTOIRE_DU_PROJET/.env}"
+COOKIES="$REPERTOIRE_DU_SKILL/.session"
+
+CONTENEUR_FRONTEND="${CONTENEUR_FRONTEND:-alexandrie_frontend}"
+
+erreur() { echo "[alx] $*" >&2; exit 1; }
+
+[ -f "$FICHIER_ENV" ] || erreur ".env introuvable : $FICHIER_ENV
+      Ce script se lance depuis un depot Alexandrie installe (make install)."
+
+lire_env() {
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$FICHIER_ENV" | tail -n1 | tr -d "'\""
+}
+DOMAINE="$(lire_env DOMAIN)"
+[ -n "$DOMAINE" ] || erreur "DOMAIN absent du .env."
+API="https://api.$DOMAINE/api"
+CDN="$(lire_env CDN_URL)"
+BUCKET="$(lire_env MINIO_BUCKET)"; BUCKET="${BUCKET:-alexandrie}"
+
+# -k : en `.localhost` le certificat est auto-signe. Ce script parle a SA
+# PROPRE machine, pas a un tiers : accepter le certificat local n'expose
+# rien. En production le certificat est valide et l'option ne sert pas.
+# / -k: this script talks to its own machine.
+CURL=(curl -sk --max-time 60)
+
+appel() {  # appel <methode> <chemin> [arguments curl...]
+    local methode="$1" chemin="$2"; shift 2
+    [ -f "$COOKIES" ] || erreur "aucune session. Commencer par :  ./alx login"
+    "${CURL[@]}" -b "$COOKIES" -X "$methode" "$API$chemin" "$@"
+}
+
+# Extrait un champ de la reponse JSON. `python3` est present partout ou
+# docker l'est ; `jq` ne l'est pas toujours.
+champ() {  # champ <chemin.pointe> < json
+    python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+for c in sys.argv[1].split('.'):
+    d = d[c] if isinstance(d, dict) else d[int(c)]
+print(d if not isinstance(d, (dict, list)) else json.dumps(d))
+" "$1"
+}
+
+
+#### LA COMPILATION, DANS LE CONTENEUR DE L'APPLICATION ####
+# Le bundle de Nuxt est MINIFIE : le fichier porte un hachage
+# (`markdown-<hash>.mjs`) et la fonction un nom d'une lettre. Les deux
+# changeront a la prochaine version de l'amont.
+#
+# On ne code donc RIEN en dur : on cherche le fichier au motif, puis on
+# essaie chaque export jusqu'a en trouver un qui, appele avec une chaine
+# markdown, rend une chaine HTML. C'est le seul critere qui survive a une
+# reminification.
+# / Nothing is hard-coded: the bundle is minified and both the file hash
+# and the export name will change. We probe for an export that turns
+# markdown into HTML — the only criterion that survives reminification.
+compiler_le_markdown() {  # markdown sur stdin -> HTML sur stdout
+    docker exec -i "$CONTENEUR_FRONTEND" node -e '
+const fs = require("fs");
+const base = "/app/.output/server/chunks/build";
+let source = "";
+process.stdin.on("data", d => source += d);
+process.stdin.on("end", async () => {
+  let fichiers;
+  try {
+    fichiers = fs.readdirSync(base).filter(f => /^markdown-.*\.mjs$/.test(f));
+  } catch (e) {
+    console.error("[alx] bundle introuvable dans " + base + " : " + e.message);
+    console.error("[alx] la structure de l+ image a-t-elle change ?");
+    process.exit(3);
+  }
+  if (!fichiers.length) {
+    console.error("[alx] aucun module markdown-*.mjs dans " + base);
+    process.exit(3);
+  }
+  const mod = await import(base + "/" + fichiers[0]);
+  // La sonde : un export qui transforme du markdown en HTML.
+  const temoin = "# _sonde_";
+  for (const nom of Object.keys(mod)) {
+    const v = mod[nom];
+    if (typeof v !== "function") continue;
+    try {
+      const r = v(temoin);
+      if (typeof r === "string" && r.includes("<h1") && r.includes("sonde")) {
+        process.stdout.write(v(source));
+        return;
+      }
+    } catch (e) { /* pas celui-la */ }
+  }
+  console.error("[alx] aucun export ne se comporte comme compile().");
+  console.error("[alx] exports vus : " + Object.keys(mod).join(", "));
+  console.error("[alx] l+ amont a probablement reorganise son bundle.");
+  process.exit(3);
+});
+'
+}
+
+verifier_le_conteneur() {
+    docker inspect "$CONTENEUR_FRONTEND" >/dev/null 2>&1 \
+        || erreur "conteneur $CONTENEUR_FRONTEND introuvable.
+      La compilation du markdown se fait DANS le conteneur du frontend,
+      qui embarque le compilateur de l'application. Demarrer la stack :
+        make install"
+    [ "$(docker inspect -f '{{.State.Running}}' "$CONTENEUR_FRONTEND")" = "true" ] \
+        || erreur "le conteneur $CONTENEUR_FRONTEND est arrete.  make start"
+}
+
+
+#### LES COMMANDES ####
+commande="${1:-aide}"; shift || true
+
+case "$commande" in
+
+aide|-h|--help)
+    sed -n '/^# USAGE/,/^# ===/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^===/d'
+    ;;
+
+login)
+    IDENTIFIANT="${1:-}"
+    [ -n "$IDENTIFIANT" ] || read -r -p "  identifiant : " IDENTIFIANT
+    read -r -s -p "  mot de passe (saisie masquee) : " MOTDEPASSE; echo
+    REPONSE="$("${CURL[@]}" -c "$COOKIES" -w '\n%{http_code}' -X POST "$API/auth" \
+        -H 'Content-Type: application/json' \
+        --data-binary @- <<EOF
+{"username": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$IDENTIFIANT"),
+ "password": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$MOTDEPASSE")}
+EOF
+)"
+    CODE="$(tail -n1 <<< "$REPONSE")"
+    if [ "$CODE" != "200" ]; then
+        rm -f "$COOKIES"
+        erreur "connexion refusee (code $CODE). Identifiant ou mot de passe ?"
+    fi
+    chmod 600 "$COOKIES"
+    echo "[alx] connecte. La session est dans $COOKIES (elle expire : relancer login au premier 401)."
+    ;;
+
+whoami)
+    appel GET "/auth/sessions" | champ result.0.user_id 2>/dev/null \
+        || erreur "session expiree ou invalide.  ./alx login"
+    ;;
+
+ls)
+    ROLE="${1:-}"
+    ID="$(appel GET "/auth/sessions" | champ result.0.user_id)"
+    appel GET "/nodes/user/$ID" | python3 -c "
+import json,sys
+role = sys.argv[1] if len(sys.argv) > 1 else None
+for n in json.load(sys.stdin)['result']:
+    if role and str(n.get('role')) != role: continue
+    etiquette = {1:'workspace', 2:'dossier', 3:'document', 4:'fichier'}.get(n.get('role'), '?')
+    print(f\"{n['id']}\t{etiquette:9}\t{n['name']}\")
+" ${ROLE:+"$ROLE"}
+    ;;
+
+compile)
+    FICHIER="${1:?usage: alx compile <fichier.md>}"
+    [ -f "$FICHIER" ] || erreur "fichier introuvable : $FICHIER"
+    verifier_le_conteneur
+    compiler_le_markdown < "$FICHIER"
+    ;;
+
+doc-create|doc-update)
+    if [ "$commande" = "doc-update" ]; then
+        ID_NOEUD="${1:?usage: alx doc-update <id> <fichier.md>}"; shift
+    fi
+    FICHIER="${1:?usage: alx doc-create <fichier.md> [--nom N] [--parent ID]}"; shift
+    [ -f "$FICHIER" ] || erreur "fichier introuvable : $FICHIER"
+
+    NOM=""; PARENT=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --nom)    NOM="${2:?--nom demande une valeur}"; shift 2 ;;
+            --parent) PARENT="${2:?--parent demande une valeur}"; shift 2 ;;
+            *) erreur "option inconnue : $1" ;;
+        esac
+    done
+    # `name` est limite a 50 caracteres cote modele : au-dela, l'API rend
+    # un 400 qui parle de validation sans dire laquelle.
+    [ -n "$NOM" ] || NOM="$(basename "$FICHIER" .md)"
+    NOM="$(cut -c1-50 <<< "$NOM")"
+
+    verifier_le_conteneur
+    HTML="$(compiler_le_markdown < "$FICHIER")"
+
+    # `accessibility` est NOT NULL SANS DEFAUT cote base : l'omettre rend
+    # un 500 « Column 'accessibility' cannot be null ». 1 = prive.
+    # `role: 3` = document. / accessibility is NOT NULL with no default.
+    CORPS="$(python3 -c "
+import json,sys
+nom, contenu, html, parent = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+d = {'name': nom, 'role': 3, 'accessibility': 1, 'access': 0,
+     'content': contenu, 'content_compiled': html}
+if parent: d['parent_id'] = parent
+print(json.dumps(d))
+" "$NOM" "$(cat "$FICHIER")" "$HTML" "$PARENT")"
+
+    if [ "$commande" = "doc-create" ]; then
+        REPONSE="$(appel POST "/nodes" -H 'Content-Type: application/json' --data-binary "$CORPS")"
+        ID="$(champ result.id <<< "$REPONSE")" || erreur "reponse inattendue : $REPONSE"
+        echo "$ID"
+        echo "[alx] cree : https://$DOMAINE/dashboard/docs/$ID" >&2
+    else
+        appel PUT "/nodes/$ID_NOEUD" -H 'Content-Type: application/json' --data-binary "$CORPS" >/dev/null
+        echo "[alx] mis a jour : https://$DOMAINE/dashboard/docs/$ID_NOEUD" >&2
+    fi
+    ;;
+
+upload)
+    FICHIER="${1:?usage: alx upload <fichier>}"
+    [ -f "$FICHIER" ] || erreur "fichier introuvable : $FICHIER"
+    REPONSE="$(appel POST "/resources" -F "file=@$FICHIER")"
+    # Le chemin public est <userId>/<transformed_path>, et le userId ne
+    # figure PAS dans la reponse : il faut le composer.
+    # / The public key is <userId>/<transformed_path>.
+    UTILISATEUR="$(champ result.user_id <<< "$REPONSE")" \
+        || erreur "televersement refuse : $REPONSE"
+    CHEMIN="$(champ result.metadata.transformed_path <<< "$REPONSE")"
+    echo "$CDN/$BUCKET/$UTILISATEUR/$CHEMIN"
+    ;;
+
+rm)
+    ID_NOEUD="${1:?usage: alx rm <id>}"
+    appel DELETE "/nodes/$ID_NOEUD" >/dev/null
+    echo "[alx] supprime : $ID_NOEUD" >&2
+    ;;
+
+*)
+    erreur "commande inconnue : $commande   (./alx aide)"
+    ;;
+esac
