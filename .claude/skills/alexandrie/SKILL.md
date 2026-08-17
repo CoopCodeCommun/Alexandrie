@@ -50,9 +50,40 @@ du même geste.
 |---|---|
 | **Authentification** | **cookie uniquement**. Pas de `Bearer`, pas de jeton d'API. `alx login` garde la session dans `.session` (chmod 600, ignoré par git). Elle expire : au premier **401**, relancer `login` |
 | **`role`** | `1` workspace, `2` dossier, `3` document, `4` fichier téléversé. Tout est dans la même table `nodes` |
-| **`accessibility`** | **obligatoire**, `NOT NULL` sans défaut. L'omettre rend un **500** « Column 'accessibility' cannot be null », qui ne dit pas quoi faire. `1` = privé |
+| **`accessibility`** | **obligatoire**, `NOT NULL` sans défaut. L'omettre rend un **500** « Column 'accessibility' cannot be null ». `1` = privé, **`3` = publié en lecture libre** |
 | **`name`** | 50 caractères maximum. Au-delà, un 400 qui parle de validation sans dire laquelle. `alx` tronque |
 | **Téléversement** | multipart, champ `file`. L'URL publique est `<CDN_URL>/<bucket>/<userId>/<transformed_path>` — le `userId` **ne figure pas** dans la réponse, il faut le composer. `alx upload` rend l'URL complète |
+
+## Publier un document en lecture libre
+
+`accessibility = 3`, et **rien d'autre**. Le commentaire du modèle amont
+(`node.model.go`) annonce `0: Public; 1: Private; 2: Unlisted` — **il est faux** :
+la requête qui sert les documents publics filtre sur `accessibility = 3`.
+
+```sql
+WHERE n.id = ? AND EXISTS (SELECT 1 FROM ancestors WHERE accessibility = 3)
+```
+
+Avec `0`, l'API rend `{"result": null}` et la page publique affiche
+« Unknown document » — sans jamais dire que le problème vient de là.
+
+L'accès est **hérité** : publier un dossier (`role` 2) publie toute sa descendance.
+
+L'URL est `https://<domaine>/doc/<identifiant>`. Il n'existe **pas** de champ
+`slug` : l'identifiant snowflake est la seule adresse. Pour une URL lisible, la
+seule voie propre est une redirection au niveau du reverse proxy.
+
+Le référencement dépend d'une chose qui ne se voit pas : le conteneur du frontend
+doit pouvoir joindre l'API **par son nom public** pour son rendu serveur. Si cet
+appel échoue, la page répond quand même 200, mais vide — titre « Unknown
+document », pas une ligne du document dans le HTML. Le navigateur, lui, refait
+l'appel côté client et affiche tout : la panne est invisible à l'œil et totale
+pour un moteur de recherche. Le `docker-compose.yml` traite ce cas (`extra_hosts`
+sur le frontend) ; vérifier après tout changement d'infrastructure :
+
+```bash
+curl -s https://<domaine>/doc/<id> | grep -o '<title>[^<]*</title>'
+```
 
 ## Trois choses à savoir avant de s'en servir
 

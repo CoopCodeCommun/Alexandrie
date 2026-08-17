@@ -285,6 +285,35 @@ services:
       NUXT_PUBLIC_BASE_CDN: ${CDN_URL}
       NUXT_PUBLIC_CDN_ENDPOINT: ${CDN_ENDPOINT:-/alexandrie/}
       NUXT_PUBLIC_BASE_URL: ${FRONTEND_URL}
+      # LE RENDU SERVEUR APPELLE L'API PAR SON NOM PUBLIC, et c'est ce qui
+      # fait — ou pas — le referencement des documents publies.
+      #
+      # La page /doc/<id> demande le document a l'API depuis le SERVEUR,
+      # avant d'envoyer le HTML. Si cet appel echoue, Nuxt rend quand meme
+      # une page 200, mais VIDE de son contenu : titre « Unknown
+      # document », description generique, et pas une ligne du document
+      # dans le HTML. Un moteur de recherche n'indexe alors rien du tout,
+      # et personne ne s'en apercoit — la page s'affiche correctement dans
+      # un navigateur, qui refait l'appel cote client.
+      #
+      # Sans `extra_hosts`, l'appel echoue en ECONNREFUSED : le nom resout
+      # sur la boucle locale DU CONTENEUR (mesure du 17 aout 2026). Meme
+      # cause et meme remede que pour le backend et le CDN, un service
+      # plus loin.
+      # / Server-side rendering fetches the API by its PUBLIC name. If that
+      # call fails, Nuxt still returns 200 — but with an empty shell:
+      # "Unknown document" and not one line of the document. Search
+      # engines index nothing, and nobody notices, because a browser
+      # re-fetches client-side and displays it fine.
+      #
+      # Node REFUSE un certificat auto-signe, et le rendu serveur echouerait
+      # donc aussi sur un poste de dev en `.localhost` — la ou le certificat
+      # n'est signe par personne. `0` le lui fait accepter. En production le
+      # certificat est valide : la valeur reste `1`, et il le verifie.
+      # / Node refuses a self-signed certificate; `0` only for dev.
+      NODE_TLS_REJECT_UNAUTHORIZED: "${SSR_VERIFIER_TLS:-1}"
+    extra_hosts:
+      - "api.${DOMAIN}:host-gateway"
     depends_on:
       - backend
     labels:
