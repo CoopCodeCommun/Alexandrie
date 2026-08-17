@@ -404,18 +404,30 @@ personne n'a rien à accepter dans son navigateur.
 
 Ce à quoi il faut faire attention, dans l'ordre où ça mord :
 
-**1. Les trois noms doivent résoudre publiquement, et le 443 être ouvert.**
-Le résolveur de TraefikV3 utilise le défi `tlsChallenge` (TLS-ALPN-01) : Let's
-Encrypt se connecte au **port 443** de la machine, sur chacun des trois noms. Un
-443 filtré, ou un nom qui ne résout pas encore, et le certificat n'arrive jamais —
-Traefik sert alors son certificat par défaut, et le navigateur crie.
+**1. Les trois noms doivent résoudre AVANT le premier démarrage.**
+`make install` le vérifie et **refuse de démarrer** si l'un manque — c'est le seul
+garde-fou du lot qui vous fait gagner une heure sèche.
 
-**2. Se tromper coûte cher, chez Let's Encrypt.** La limite est de 5 certificats
-identiques par semaine. Tant que la configuration n'est pas sûre, décommenter la
-ligne `caserver` de `traefik.yml` pour viser le serveur de test : les certificats
-ne sont pas reconnus par les navigateurs, mais ils sont illimités. La recommenter
-une fois que ça marche, puis supprimer `letsencrypt/acme.json` pour forcer une
-vraie émission.
+Pourquoi : dès que les conteneurs montent, Traefik demande un certificat par nom.
+Let's Encrypt plafonne à **cinq échecs de validation par nom et par heure**, et le
+quota se consomme en quelques secondes. Le nom reste alors sans certificat pendant
+une heure, **même une fois le DNS corrigé**.
+
+> Vécu le 17 août 2026, sur ce dépôt. Seul le domaine principal avait son
+> enregistrement ; le DNS a été complété dans la minute, mais le mal était fait :
+> `429 too many failed authorizations (5) for "cdn.…" in the last 1h0m0s`. Et le
+> symptôme côté navigateur ne ressemblait à rien de connu — un
+> `NetworkError when attempting to fetch resource` à l'inscription, qui envoie
+> chercher un problème de CORS ou de réseau. Une heure d'attente, plus une heure de
+> diagnostic.
+
+Le défi utilisé est `tlsChallenge` (TLS-ALPN-01) : Let's Encrypt se connecte au
+**port 443**, qui doit donc être ouvert depuis l'extérieur.
+
+**2. Pour mettre au point sans rien consommer**, viser le serveur de test :
+décommenter la ligne `caserver` de `traefik.yml`. Les certificats ne sont pas
+reconnus par les navigateurs, mais ils sont illimités. La recommenter une fois que
+ça marche, puis supprimer `letsencrypt/acme.json` pour forcer une vraie émission.
 
 **3. Fermer l'inscription dans la minute.** Voir
 [Le premier compte](#le-premier-compte-à-faire-tout-de-suite). Sur un serveur

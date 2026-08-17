@@ -31,6 +31,7 @@ COMPOSE := docker compose
 RESEAU_DU_PROXY := frontend
 
 SCRIPT_DE_CONFIGURATION := bin/configurer_env.sh
+SCRIPT_DE_VERIFICATION_DNS := bin/verifier_dns.sh
 SCRIPT_D_ATTENTE        := bin/attendre.sh
 SCRIPT_DE_SAUVEGARDE    := bin/backup.sh
 SCRIPT_DE_VERIFICATION  := bin/verifier_archive.sh
@@ -100,6 +101,15 @@ install: .verif-docker  ## TOUT : .env + reseau + conteneurs + attente (idempote
 	@docker network inspect $(RESEAU_DU_PROXY) >/dev/null 2>&1 \
 		|| { echo "[install] creation du reseau $(RESEAU_DU_PROXY)"; \
 		     docker network create $(RESEAU_DU_PROXY) >/dev/null; }
+	@# LE CONTROLE DNS PASSE AVANT LE PREMIER `up`, ET C'EST TOUT
+	@# L'INTERET. Demarrer avant que les trois noms ne resolvent fait
+	@# bruler le quota de Let's Encrypt — cinq echecs par nom et par
+	@# heure — et le nom reste sans certificat pendant une heure, meme
+	@# une fois le DNS corrige. Constate en production le 17 aout 2026.
+	@# Apres le `up`, il serait trop tard : le mal est fait en quelques
+	@# secondes. / Before the first `up`, because afterwards it is too
+	@# late: the quota burns in seconds.
+	@bash $(SCRIPT_DE_VERIFICATION_DNS)
 	$(COMPOSE) up -d
 	@bash $(SCRIPT_D_ATTENTE) 300
 	@echo ""
